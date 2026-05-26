@@ -1,0 +1,1 @@
+savedcmd_/home/pluto/kernel-security-probe/kernel/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/pluto/kernel-security-probe/kernel/Module.symvers -T /home/pluto/kernel-security-probe/kernel/modules.order -i Module.symvers -e 

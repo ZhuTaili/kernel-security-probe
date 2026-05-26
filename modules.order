@@ -1,0 +1,709 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * secprobe.c
+ *
+ * 基于 Kprobe 的 Linux 内核安全探针：降低误报后的完整替换版本
+ *
+ * 核心规则：
+ *   1. /etc/passwd、/etc/group：读取忽略；写入才作为高危事件计分；
+ *   2. /etc/sudoers、/etc/sudoers.d/*：读取只观察、不计分；写入高危计分；
+ *   3. /etc/shadow、/etc/gshadow：读取告警计分；写入高危计分；
+ *   4. /root/*：读取告警计分；写入高危计分；
+ *   5. 危险命令执行：告警并计分；
+ *   6. 可疑端口 connect/bind：告警并计分；
+ *
+ * 功能：
+ *   - 程序执行监控；
+ *   - 敏感文件访问监控，区分读取与写入；
+ *   - 可疑网络连接与端口绑定监控；
+ *   - 保存最近告警事件；
+ *   - 统计告警次数与本次加载周期累计风险分数；
+ *   - 通过 /proc/secprobe_stats 提供运行时查看接口。
+ *
+ * 说明：本模块仅监控和告警，不主动阻断行为。
+ */
+
+#define pr_fmt(fmt) "SEC_PROBE: " fmt
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/version.h>
+#include <linux/kprobes.h>
+#include <linux/ptrace.h>
+#include <linux/binfmts.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/err.h>
+#include <linux/sched.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
+#include <linux/string.h>
+#include <linux/atomic.h>
+#include <linux/net.h>
+#include <linux/socket.h>
+#include <linux/in.h>
+#include <linux/in6.h>
+#include <linux/byteorder/generic.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/spinlock.h>
+#include <linux/timekeeping.h>
+
+#ifndef CONFIG_X86_64
+#error "secprobe currently supports x86_64 Ubuntu virtual machines only."
+#endif
+
+#define PATH_BUF_SIZE          512
+#define PROC_FILE_NAME         "secprobe_stats"
+#define MAX_RECENT_ALERTS      20
+#define EVENT_LEVEL_SIZE       16
+#define EVENT_TYPE_SIZE        16
+#define EVENT_DETAIL_SIZE      192
+
+/* 计分规则：只给高置信告警计分，WATCH 事件始终为 0 分。 */
+#define SCORE_DANGEROUS_EXEC       2
+#define SCORE_SENSITIVE_READ       3
+#define SCORE_CRITICAL_WRITE       5
+#define SCORE_SUSPICIOUS_CONNECT   3
+#define SCORE_SUSPICIOUS_BIND      3
+
+static bool verbose_exec;
+module_param(verbose_exec, bool, 0644);
+MODULE_PARM_DESC(verbose_exec, "Log normal program execution events");
+
+static bool verbose_net;
+module_param(verbose_net, bool, 0644);
+MODULE_PARM_DESC(verbose_net, "Log normal network events");
+
+/* 是否要求新增的 bind 探针也必须加载成功。默认不要求，兼容性更好。 */
+static bool require_bind_probe;
+module_param(require_bind_probe, bool, 0644);
+MODULE_PARM_DESC(require_bind_probe, "Fail module load if security_socket_bind probe is unavailable");
+
+/* 运行周期统计。重新卸载并 insmod 后会从 0 重新开始。 */
+static atomic64_t total_exec_count = ATOMIC64_INIT(0);
+static atomic64_t dangerous_exec_alert_count = ATOMIC64_INIT(0);
+static atomic64_t watched_file_count = ATOMIC64_INIT(0);
+static atomic64_t sensitive_file_alert_count = ATOMIC64_INIT(0);
+static atomic64_t critical_file_write_count = ATOMIC64_INIT(0);
+static atomic64_t total_connect_count = ATOMIC64_INIT(0);
+static atomic64_t suspicious_connect_alert_count = ATOMIC64_INIT(0);
+static atomic64_t total_bind_count = ATOMIC64_INIT(0);
+static atomic64_t suspicious_bind_alert_count = ATOMIC64_INIT(0);
+static atomic64_t total_alert_count = ATOMIC64_INIT(0);
+static atomic64_t total_risk_score = ATOMIC64_INIT(0);
+
+static bool exec_probe_registered;
+static bool file_probe_registered;
+static bool connect_probe_registered;
+static bool bind_probe_registered;
+static struct proc_dir_entry *stats_proc_entry;
+
+struct alert_event {
+    u64 sequence;
+    u64 timestamp_seconds;
+    unsigned int score;
+    char level[EVENT_LEVEL_SIZE];
+    char type[EVENT_TYPE_SIZE];
+    char detail[EVENT_DETAIL_SIZE];
+};
+
+static struct alert_event recent_alerts[MAX_RECENT_ALERTS];
+static unsigned int recent_next;
+static unsigned int recent_count;
+static u64 alert_sequence;
+static DEFINE_SPINLOCK(alert_lock);
+
+enum file_action {
+    FILE_IGNORE = 0,
+    FILE_WATCH,
+    FILE_ALERT_READ,
+    FILE_CRITICAL_WRITE
+};
+
+static unsigned int current_uid_number(void)
+{
+    return __kuid_val(current_uid());
+}
+
+static unsigned int current_euid_number(void)
+{
+    return __kuid_val(current_euid());
+}
+
+static const char *path_basename(const char *path)
+{
+    const char *slash;
+
+    if (path == NULL)
+        return "";
+
+    slash = strrchr(path, '/');
+    return slash != NULL ? slash + 1 : path;
+}
+
+static bool path_has_prefix(const char *path, const char *prefix)
+{
+    if (path == NULL || prefix == NULL)
+        return false;
+
+    return strncmp(path, prefix, strlen(prefix)) == 0;
+}
+
+/*
+ * 危险命令规则。
+ * 这些命令在本课程安全实验中视为需要告警的高风险工具。
+ */
+static bool is_dangerous_command(const char *command)
+{
+    return strcmp(command, "nc") == 0 ||
+           strcmp(command, "nc.openbsd") == 0 ||
+           strcmp(command, "netcat") == 0 ||
+           strcmp(command, "ncat") == 0 ||
+           strcmp(command, "socat") == 0 ||
+           strcmp(command, "nmap") == 0;
+}
+
+static bool is_suspicious_port(unsigned short port)
+{
+    return port == 4444 || port == 5555 || port == 1337;
+}
+
+/*
+ * 仅对高置信度事件返回 ALERT/CRITICAL。
+ * passwd/group 的读取直接忽略；sudoers 的读取只观察且不计分。
+ */
+static enum file_action classify_file_action(const char *path, bool writing)
+{
+    if (strcmp(path, "/etc/passwd") == 0 ||
+        strcmp(path, "/etc/group") == 0) {
+        return writing ? FILE_CRITICAL_WRITE : FILE_IGNORE;
+    }
+
+    if (strcmp(path, "/etc/sudoers") == 0 ||
+        path_has_prefix(path, "/etc/sudoers.d/")) {
+        return writing ? FILE_CRITICAL_WRITE : FILE_WATCH;
+    }
+
+    if (strcmp(path, "/etc/shadow") == 0 ||
+        strcmp(path, "/etc/gshadow") == 0) {
+        return writing ? FILE_CRITICAL_WRITE : FILE_ALERT_READ;
+    }
+
+    if (path_has_prefix(path, "/root/")) {
+        return writing ? FILE_CRITICAL_WRITE : FILE_ALERT_READ;
+    }
+
+    return FILE_IGNORE;
+}
+
+static const char *session_risk_level(long long score)
+{
+    if (score >= 20)
+        return "CRITICAL";
+    if (score >= 10)
+        return "HIGH";
+    if (score >= 4)
+        return "MEDIUM";
+    if (score > 0)
+        return "LOW";
+    return "NONE";
+}
+
+/* 保存真正计分的最近告警事件；WATCH 不进入该列表。 */
+static void record_scored_alert(const char *level, const char *type,
+                                unsigned int score, const char *detail)
+{
+    unsigned long flags;
+    struct alert_event *event;
+
+    atomic64_inc(&total_alert_count);
+    atomic64_add(score, &total_risk_score);
+
+    spin_lock_irqsave(&alert_lock, flags);
+
+    event = &recent_alerts[recent_next];
+    alert_sequence++;
+    event->sequence = alert_sequence;
+    event->timestamp_seconds = ktime_get_real_seconds();
+    event->score = score;
+    strscpy(event->level, level, sizeof(event->level));
+    strscpy(event->type, type, sizeof(event->type));
+    strscpy(event->detail, detail, sizeof(event->detail));
+
+    recent_next = (recent_next + 1) % MAX_RECENT_ALERTS;
+    if (recent_count < MAX_RECENT_ALERTS)
+        recent_count++;
+
+    spin_unlock_irqrestore(&alert_lock, flags);
+}
+
+/* 探针一：程序执行监控。 */
+static int exec_pre_handler(struct kprobe *probe, struct pt_regs *regs)
+{
+    struct linux_binprm *bprm;
+    const char *filename;
+    const char *command;
+    char detail[EVENT_DETAIL_SIZE];
+
+    (void)probe;
+    bprm = (struct linux_binprm *)regs->di;
+
+    if (bprm == NULL || bprm->filename == NULL)
+        return 0;
+
+    filename = bprm->filename;
+    command = path_basename(filename);
+    atomic64_inc(&total_exec_count);
+
+    if (is_dangerous_command(command)) {
+        atomic64_inc(&dangerous_exec_alert_count);
+        scnprintf(detail, sizeof(detail),
+                  "uid=%u euid=%u pid=%d comm=%s path=%s",
+                  current_uid_number(), current_euid_number(),
+                  current->pid, current->comm, filename);
+        record_scored_alert("ALERT", "EXEC", SCORE_DANGEROUS_EXEC, detail);
+        pr_warn_ratelimited(
+            "[ALERT][EXEC] score=%u dangerous command executed: %s\n",
+            SCORE_DANGEROUS_EXEC, detail);
+    } else if (verbose_exec) {
+        pr_info_ratelimited(
+            "[EXEC] uid=%u euid=%u pid=%d comm=%s path=%s\n",
+            current_uid_number(), current_euid_number(),
+            current->pid, current->comm, filename);
+    }
+
+    return 0;
+}
+NOKPROBE_SYMBOL(exec_pre_handler);
+
+/* 探针二：敏感文件访问监控，读取与写入分开处理。 */
+static int file_pre_handler(struct kprobe *probe, struct pt_regs *regs)
+{
+    struct file *file;
+    char path_buffer[PATH_BUF_SIZE];
+    char detail[EVENT_DETAIL_SIZE];
+    char *path;
+    bool writing;
+    enum file_action action;
+
+    (void)probe;
+    file = (struct file *)regs->di;
+
+    if (file == NULL)
+        return 0;
+
+    path = d_path(&file->f_path, path_buffer, sizeof(path_buffer));
+    if (IS_ERR(path))
+        return 0;
+
+    writing = (file->f_mode & FMODE_WRITE) != 0;
+    action = classify_file_action(path, writing);
+
+    if (action == FILE_IGNORE)
+        return 0;
+
+    scnprintf(detail, sizeof(detail),
+              "uid=%u euid=%u pid=%d comm=%s mode=%s path=%s",
+              current_uid_number(), current_euid_number(),
+              current->pid, current->comm,
+              writing ? "WRITE" : "READ", path);
+
+    if (action == FILE_WATCH) {
+        atomic64_inc(&watched_file_count);
+        pr_info_ratelimited(
+            "[WATCH][FILE] score=0 sudoers read observed but not scored: %s\n",
+            detail);
+        return 0;
+    }
+
+    if (action == FILE_ALERT_READ) {
+        atomic64_inc(&sensitive_file_alert_count);
+        record_scored_alert("ALERT", "FILE", SCORE_SENSITIVE_READ, detail);
+        pr_warn_ratelimited(
+            "[ALERT][FILE][READ] score=%u sensitive file read: %s\n",
+            SCORE_SENSITIVE_READ, detail);
+        return 0;
+    }
+
+    atomic64_inc(&critical_file_write_count);
+    record_scored_alert("CRITICAL", "FILE", SCORE_CRITICAL_WRITE, detail);
+    pr_warn_ratelimited(
+        "[CRITICAL][FILE][WRITE] score=%u critical file opened for writing: %s\n",
+        SCORE_CRITICAL_WRITE, detail);
+
+    return 0;
+}
+NOKPROBE_SYMBOL(file_pre_handler);
+
+static void handle_ipv4_network_event(const char *operation,
+                                      struct sockaddr_in *address,
+                                      bool is_bind)
+{
+    unsigned short port;
+    unsigned int score;
+    char detail[EVENT_DETAIL_SIZE];
+
+    port = be16_to_cpu(address->sin_port);
+    if (!is_suspicious_port(port)) {
+        if (verbose_net) {
+            pr_info_ratelimited(
+                "[NET][%s] uid=%u euid=%u pid=%d comm=%s addr=%pI4:%u\n",
+                operation, current_uid_number(), current_euid_number(),
+                current->pid, current->comm,
+                &address->sin_addr.s_addr, port);
+        }
+        return;
+    }
+
+    score = is_bind ? SCORE_SUSPICIOUS_BIND : SCORE_SUSPICIOUS_CONNECT;
+    scnprintf(detail, sizeof(detail),
+              "uid=%u euid=%u pid=%d comm=%s addr=%pI4:%u",
+              current_uid_number(), current_euid_number(),
+              current->pid, current->comm,
+              &address->sin_addr.s_addr, port);
+
+    if (is_bind)
+        atomic64_inc(&suspicious_bind_alert_count);
+    else
+        atomic64_inc(&suspicious_connect_alert_count);
+
+    record_scored_alert("ALERT", "NET", score, detail);
+    pr_warn_ratelimited(
+        "[ALERT][NET][%s] score=%u suspicious port matched: %s\n",
+        operation, score, detail);
+}
+
+static void handle_ipv6_network_event(const char *operation,
+                                      struct sockaddr_in6 *address,
+                                      bool is_bind)
+{
+    unsigned short port;
+    unsigned int score;
+    char detail[EVENT_DETAIL_SIZE];
+
+    port = be16_to_cpu(address->sin6_port);
+    if (!is_suspicious_port(port)) {
+        if (verbose_net) {
+            pr_info_ratelimited(
+                "[NET][%s] uid=%u euid=%u pid=%d comm=%s addr=[%pI6c]:%u\n",
+                operation, current_uid_number(), current_euid_number(),
+                current->pid, current->comm,
+                &address->sin6_addr, port);
+        }
+        return;
+    }
+
+    score = is_bind ? SCORE_SUSPICIOUS_BIND : SCORE_SUSPICIOUS_CONNECT;
+    scnprintf(detail, sizeof(detail),
+              "uid=%u euid=%u pid=%d comm=%s addr=[%pI6c]:%u",
+              current_uid_number(), current_euid_number(),
+              current->pid, current->comm,
+              &address->sin6_addr, port);
+
+    if (is_bind)
+        atomic64_inc(&suspicious_bind_alert_count);
+    else
+        atomic64_inc(&suspicious_connect_alert_count);
+
+    record_scored_alert("ALERT", "NET", score, detail);
+    pr_warn_ratelimited(
+        "[ALERT][NET][%s] score=%u suspicious port matched: %s\n",
+        operation, score, detail);
+}
+
+/* 探针三：监控主动连接到可疑端口。 */
+static int connect_pre_handler(struct kprobe *probe, struct pt_regs *regs)
+{
+    struct sockaddr *address;
+    int address_len;
+
+    (void)probe;
+    address = (struct sockaddr *)regs->si;
+    address_len = (int)regs->dx;
+
+    if (address == NULL)
+        return 0;
+
+    if (address->sa_family == AF_INET &&
+        address_len >= sizeof(struct sockaddr_in)) {
+        atomic64_inc(&total_connect_count);
+        handle_ipv4_network_event("CONNECT", (struct sockaddr_in *)address, false);
+    } else if (address->sa_family == AF_INET6 &&
+               address_len >= sizeof(struct sockaddr_in6)) {
+        atomic64_inc(&total_connect_count);
+        handle_ipv6_network_event("CONNECT", (struct sockaddr_in6 *)address, false);
+    }
+
+    return 0;
+}
+NOKPROBE_SYMBOL(connect_pre_handler);
+
+/* 探针四：补充监控绑定可疑端口，如 nc -l 4444。 */
+static int bind_pre_handler(struct kprobe *probe, struct pt_regs *regs)
+{
+    struct sockaddr *address;
+    int address_len;
+
+    (void)probe;
+    address = (struct sockaddr *)regs->si;
+    address_len = (int)regs->dx;
+
+    if (address == NULL)
+        return 0;
+
+    if (address->sa_family == AF_INET &&
+        address_len >= sizeof(struct sockaddr_in)) {
+        atomic64_inc(&total_bind_count);
+        handle_ipv4_network_event("BIND", (struct sockaddr_in *)address, true);
+    } else if (address->sa_family == AF_INET6 &&
+               address_len >= sizeof(struct sockaddr_in6)) {
+        atomic64_inc(&total_bind_count);
+        handle_ipv6_network_event("BIND", (struct sockaddr_in6 *)address, true);
+    }
+
+    return 0;
+}
+NOKPROBE_SYMBOL(bind_pre_handler);
+
+static struct kprobe exec_probe = {
+    .symbol_name = "security_bprm_check",
+    .pre_handler = exec_pre_handler,
+};
+
+static struct kprobe file_probe = {
+    .symbol_name = "security_file_open",
+    .pre_handler = file_pre_handler,
+};
+
+static struct kprobe connect_probe = {
+    .symbol_name = "security_socket_connect",
+    .pre_handler = connect_pre_handler,
+};
+
+static struct kprobe bind_probe = {
+    .symbol_name = "security_socket_bind",
+    .pre_handler = bind_pre_handler,
+};
+
+static int stats_proc_show(struct seq_file *m, void *v)
+{
+    long long score;
+    unsigned int count;
+    unsigned int next;
+    unsigned int i;
+    unsigned int index;
+    unsigned long flags;
+    struct alert_event event;
+
+    (void)v;
+    score = (long long)atomic64_read(&total_risk_score);
+
+    seq_puts(m, "secprobe status\n");
+    seq_puts(m, "==============\n");
+    seq_printf(m, "session_risk_score=%lld\n", score);
+    seq_printf(m, "session_risk_level=%s\n\n", session_risk_level(score));
+
+    seq_puts(m, "scoring rules\n");
+    seq_puts(m, "-------------\n");
+    seq_printf(m, "dangerous_command_exec=+%d\n", SCORE_DANGEROUS_EXEC);
+    seq_printf(m, "shadow_or_root_read=+%d\n", SCORE_SENSITIVE_READ);
+    seq_printf(m, "critical_file_write=+%d\n", SCORE_CRITICAL_WRITE);
+    seq_printf(m, "suspicious_port_connect=+%d\n", SCORE_SUSPICIOUS_CONNECT);
+    seq_printf(m, "suspicious_port_bind=+%d\n", SCORE_SUSPICIOUS_BIND);
+    seq_puts(m, "passwd_group_read=ignored\n");
+    seq_puts(m, "sudoers_read=watch_only_score_0\n\n");
+
+    seq_puts(m, "statistics\n");
+    seq_puts(m, "----------\n");
+    seq_printf(m, "total_exec=%lld\n",
+               (long long)atomic64_read(&total_exec_count));
+    seq_printf(m, "dangerous_exec_alert=%lld\n",
+               (long long)atomic64_read(&dangerous_exec_alert_count));
+    seq_printf(m, "watched_file_not_scored=%lld\n",
+               (long long)atomic64_read(&watched_file_count));
+    seq_printf(m, "sensitive_file_read_alert=%lld\n",
+               (long long)atomic64_read(&sensitive_file_alert_count));
+    seq_printf(m, "critical_file_write_alert=%lld\n",
+               (long long)atomic64_read(&critical_file_write_count));
+    seq_printf(m, "total_connect=%lld\n",
+               (long long)atomic64_read(&total_connect_count));
+    seq_printf(m, "suspicious_connect_alert=%lld\n",
+               (long long)atomic64_read(&suspicious_connect_alert_count));
+    seq_printf(m, "total_bind=%lld\n",
+               (long long)atomic64_read(&total_bind_count));
+    seq_printf(m, "suspicious_bind_alert=%lld\n",
+               (long long)atomic64_read(&suspicious_bind_alert_count));
+    seq_printf(m, "total_scored_alert=%lld\n\n",
+               (long long)atomic64_read(&total_alert_count));
+
+    seq_puts(m, "recent scored alerts (newest first)\n");
+    seq_puts(m, "-----------------------------------\n");
+
+    spin_lock_irqsave(&alert_lock, flags);
+    count = recent_count;
+    next = recent_next;
+    spin_unlock_irqrestore(&alert_lock, flags);
+
+    if (count == 0) {
+        seq_puts(m, "none\n");
+        return 0;
+    }
+
+    for (i = 0; i < count; i++) {
+        index = (next + MAX_RECENT_ALERTS - 1 - i) % MAX_RECENT_ALERTS;
+
+        spin_lock_irqsave(&alert_lock, flags);
+        event = recent_alerts[index];
+        spin_unlock_irqrestore(&alert_lock, flags);
+
+        seq_printf(m, "#%llu time=%llu level=%s type=%s score=+%u %s\n",
+                   (unsigned long long)event.sequence,
+                   (unsigned long long)event.timestamp_seconds,
+                   event.level, event.type, event.score, event.detail);
+    }
+
+    return 0;
+}
+
+static int stats_proc_open(struct inode *inode, struct file *file)
+{
+    (void)inode;
+    return single_open(file, stats_proc_show, NULL);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+static const struct proc_ops stats_proc_ops = {
+    .proc_open = stats_proc_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+#else
+static const struct file_operations stats_proc_ops = {
+    .owner = THIS_MODULE,
+    .open = stats_proc_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+#endif
+
+static void unregister_all_probes(void)
+{
+    if (bind_probe_registered) {
+        unregister_kprobe(&bind_probe);
+        bind_probe_registered = false;
+    }
+
+    if (connect_probe_registered) {
+        unregister_kprobe(&connect_probe);
+        connect_probe_registered = false;
+    }
+
+    if (file_probe_registered) {
+        unregister_kprobe(&file_probe);
+        file_probe_registered = false;
+    }
+
+    if (exec_probe_registered) {
+        unregister_kprobe(&exec_probe);
+        exec_probe_registered = false;
+    }
+}
+
+static int __init secprobe_init(void)
+{
+    int ret;
+    int active_probes = 0;
+
+    pr_info("loading low-noise kernel security probe module\n");
+
+    ret = register_kprobe(&exec_probe);
+    if (ret != 0) {
+        pr_err("failed to register required probe security_bprm_check, error=%d\n", ret);
+        return ret;
+    }
+    exec_probe_registered = true;
+    active_probes++;
+    pr_info("registered probe: security_bprm_check\n");
+
+    ret = register_kprobe(&file_probe);
+    if (ret != 0) {
+        pr_err("failed to register required probe security_file_open, error=%d\n", ret);
+        unregister_all_probes();
+        return ret;
+    }
+    file_probe_registered = true;
+    active_probes++;
+    pr_info("registered probe: security_file_open\n");
+
+    ret = register_kprobe(&connect_probe);
+    if (ret != 0) {
+        pr_err("failed to register required probe security_socket_connect, error=%d\n", ret);
+        unregister_all_probes();
+        return ret;
+    }
+    connect_probe_registered = true;
+    active_probes++;
+    pr_info("registered probe: security_socket_connect\n");
+
+    ret = register_kprobe(&bind_probe);
+    if (ret == 0) {
+        bind_probe_registered = true;
+        active_probes++;
+        pr_info("registered enhanced probe: security_socket_bind\n");
+    } else if (require_bind_probe) {
+        pr_err("required bind probe registration failed, error=%d\n", ret);
+        unregister_all_probes();
+        return ret;
+    } else {
+        pr_warn("optional bind probe unavailable, error=%d; base monitoring remains active\n", ret);
+    }
+
+    stats_proc_entry = proc_create(PROC_FILE_NAME, 0444, NULL, &stats_proc_ops);
+    if (stats_proc_entry == NULL) {
+        pr_err("failed to create /proc/%s\n", PROC_FILE_NAME);
+        unregister_all_probes();
+        return -ENOMEM;
+    }
+
+    pr_info("module loaded successfully, active_probes=%d\n", active_probes);
+    pr_info("stats interface ready: /proc/%s\n", PROC_FILE_NAME);
+    pr_info("noise reduction enabled: passwd/group reads ignored; sudoers reads watch only\n");
+    return 0;
+}
+
+static void __exit secprobe_exit(void)
+{
+    long long score;
+
+    if (stats_proc_entry != NULL) {
+        remove_proc_entry(PROC_FILE_NAME, NULL);
+        stats_proc_entry = NULL;
+    }
+
+    unregister_all_probes();
+    score = (long long)atomic64_read(&total_risk_score);
+
+    pr_info(
+        "module unloaded: score=%lld level=%s alerts=%lld dangerous_exec=%lld watch_file=%lld sensitive_read=%lld critical_write=%lld suspicious_connect=%lld suspicious_bind=%lld\n",
+        score, session_risk_level(score),
+        (long long)atomic64_read(&total_alert_count),
+        (long long)atomic64_read(&dangerous_exec_alert_count),
+        (long long)atomic64_read(&watched_file_count),
+        (long long)atomic64_read(&sensitive_file_alert_count),
+        (long long)atomic64_read(&critical_file_write_count),
+        (long long)atomic64_read(&suspicious_connect_alert_count),
+        (long long)atomic64_read(&suspicious_bind_alert_count));
+}
+
+module_init(secprobe_init);
+module_exit(secprobe_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Kernel Security Probe Project Team");
+MODULE_DESCRIPTION("Kprobe-based Linux kernel security monitoring probe with low-noise scoring rules");
+MODULE_VERSION("2.0");
+
