@@ -1,5 +1,5 @@
-<pre><font color="#4E9A06"><b>ztl@ubuntu</b></font>:<font color="#3465A4"><b>~</b></font>$   cd /home/ztl/kernel-security-probe/userspace
-<font color="#4E9A06"><b>ztl@ubuntu</b></font>:<font color="#3465A4"><b>~/kernel-security-probe/userspace</b></font>$   sudo ./secprobe_monitor
+ztl@ubuntu:~$   cd /home/ztl/kernel-security-probe/userspace
+ztl@ubuntu:~/kernel-security-probe/userspace$   sudo ./secprobe_monitor
 [sudo] ztl 的密码： 
 1
 对不起，请重试。
@@ -204,4 +204,215 @@ Recent kernel-confirmed alerts:
 
 ----------------------------------------------------------------------
 Press Ctrl+C to exit.
-=============================</pre>
+======================================================================
+
+======================================================================
+                  Kernel Security Probe Monitor
+======================================================================
+Communication : Netlink realtime alert channel
+Detection     : Completed inside kernel module secprobe.ko
+Display note  : Short duplicate events are merged as xN
+----------------------------------------------------------------------
+Received alerts : 7        MEDIUM: 2      HIGH: 4      CRITICAL: 1     
+Type summary    : EXEC: 2        FILE: 5        NET: 0       
+----------------------------------------------------------------------
+Recent kernel-confirmed alerts:
+
+  [14:54:08] FILE HIGH     READ    pid=4910   comm=sudo        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=1000 euid=0
+
+  [14:55:48] EXEC MEDIUM   EXEC    pid=5014   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [14:56:24] FILE HIGH     READ    pid=5018   comm=cat          x2
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:32] FILE CRITICAL WRITE   pid=4808   comm=bash        
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:38] FILE HIGH     READ    pid=5019   comm=head        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=0 euid=0
+
+  [15:04:18] EXEC MEDIUM   EXEC    pid=5269   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+----------------------------------------------------------------------
+Press Ctrl+C to exit.
+======================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+======================================================================
+                  Kernel Security Probe Monitor
+======================================================================
+Communication : Netlink realtime alert channel
+Detection     : Completed inside kernel module secprobe.ko
+Display note  : Short duplicate events are merged as xN
+----------------------------------------------------------------------
+Received alerts : 8        MEDIUM: 2      HIGH: 5      CRITICAL: 1     
+Type summary    : EXEC: 2        FILE: 5        NET: 1       
+----------------------------------------------------------------------
+Recent kernel-confirmed alerts:
+
+  [14:54:08] FILE HIGH     READ    pid=4910   comm=sudo        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=1000 euid=0
+
+  [14:55:48] EXEC MEDIUM   EXEC    pid=5014   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [14:56:24] FILE HIGH     READ    pid=5018   comm=cat          x2
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:32] FILE CRITICAL WRITE   pid=4808   comm=bash        
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:38] FILE HIGH     READ    pid=5019   comm=head        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=0 euid=0
+
+  [15:04:18] EXEC MEDIUM   EXEC    pid=5269   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [15:04:18] NET  HIGH     CONNECT pid=5269   comm=nc          
+             rule=SUSPICIOUS_TOOL_CONNECT  target=127.0.0.1:8001
+             uid=1000 euid=1000
+
+----------------------------------------------------------------------
+Press Ctrl+C to exit.
+======================================================================
+
+
+
+
+
+
+
+
+
+
+======================================================================
+                  Kernel Security Probe Monitor
+======================================================================
+Communication : Netlink realtime alert channel
+Detection     : Completed inside kernel module secprobe.ko
+Display note  : Short duplicate events are merged as xN
+----------------------------------------------------------------------
+Received alerts : 9        MEDIUM: 3      HIGH: 5      CRITICAL: 1     
+Type summary    : EXEC: 3        FILE: 5        NET: 1       
+----------------------------------------------------------------------
+Recent kernel-confirmed alerts:
+
+  [14:54:08] FILE HIGH     READ    pid=4910   comm=sudo        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=1000 euid=0
+
+  [14:55:48] EXEC MEDIUM   EXEC    pid=5014   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [14:56:24] FILE HIGH     READ    pid=5018   comm=cat          x2
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:32] FILE CRITICAL WRITE   pid=4808   comm=bash        
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:38] FILE HIGH     READ    pid=5019   comm=head        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=0 euid=0
+
+  [15:04:18] EXEC MEDIUM   EXEC    pid=5269   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [15:04:18] NET  HIGH     CONNECT pid=5269   comm=nc          
+             rule=SUSPICIOUS_TOOL_CONNECT  target=127.0.0.1:8001
+             uid=1000 euid=1000
+
+  [15:04:25] EXEC MEDIUM   EXEC    pid=5309   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+----------------------------------------------------------------------
+Press Ctrl+C to exit.
+======================================================================
+
+
+
+
+
+
+======================================================================
+                  Kernel Security Probe Monitor
+======================================================================
+Communication : Netlink realtime alert channel
+Detection     : Completed inside kernel module secprobe.ko
+Display note  : Short duplicate events are merged as xN
+----------------------------------------------------------------------
+Received alerts : 10       MEDIUM: 3      HIGH: 5      CRITICAL: 2     
+Type summary    : EXEC: 3        FILE: 5        NET: 2       
+----------------------------------------------------------------------
+Recent kernel-confirmed alerts:
+
+  [14:54:08] FILE HIGH     READ    pid=4910   comm=sudo        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=1000 euid=0
+
+  [14:55:48] EXEC MEDIUM   EXEC    pid=5014   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [14:56:24] FILE HIGH     READ    pid=5018   comm=cat          x2
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:32] FILE CRITICAL WRITE   pid=4808   comm=bash        
+             rule=DEMO_SECRET              target=/root/secprobe_demo.txt
+             uid=0 euid=0
+
+  [14:56:38] FILE HIGH     READ    pid=5019   comm=head        
+             rule=CREDENTIAL_SECRET        target=/etc/shadow
+             uid=0 euid=0
+
+  [15:04:18] EXEC MEDIUM   EXEC    pid=5269   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [15:04:18] NET  HIGH     CONNECT pid=5269   comm=nc          
+             rule=SUSPICIOUS_TOOL_CONNECT  target=127.0.0.1:8001
+             uid=1000 euid=1000
+
+  [15:04:25] EXEC MEDIUM   EXEC    pid=5309   comm=bash        
+             rule=SUSPICIOUS_TOOL          target=/usr/bin/nc
+             uid=1000 euid=1000
+
+  [15:04:25] NET  CRITICAL CONNECT pid=5309   comm=nc          
+             rule=TOOL_AND_WATCH_PORT      target=127.0.0.1:8888
+             uid=1000 euid=1000
+
+----------------------------------------------------------------------
+Press Ctrl+C to exit.
+======================================================================
